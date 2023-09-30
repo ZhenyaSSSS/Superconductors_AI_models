@@ -391,6 +391,9 @@ class AutoEncoderModel(pl.LightningModule):
         data = self.norm(self.encoder(data))
         data = self.decoder(data)
         return self.decoder_head(data[:-1]), self.cls_head(data[-1])
+    def decoder_forward(self, data):
+        data = self.decoder(self.norm(data))
+        return self.decoder_head(data[:-1]), self.cls_head(data[-1])
     def on_validation_epoch_end(self):
         gc.collect()
         self.trainer.save_checkpoint(filepath="/kaggle/working/checkpoint.ckpt")
