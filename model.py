@@ -3,7 +3,7 @@ import torch.nn as nn
 import pytorch_lightning as pl
 import random
 import torchmetrics
-import torch.Tensor as Tensor
+from torch import Tensor
 import gc
 from timm.models.layers import DropPath
 class SwiGLU(nn.Module):
