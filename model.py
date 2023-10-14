@@ -344,7 +344,149 @@ class Decoder(nn.Module):
                 x = self.norm(self.upsamples[i](x))
                 hidden.append(x)
         return hidden
-      
+        
+class NumberModel(pl.LightningModule):
+    def __init__(
+        self,
+        learning_rate: float = 0.00002,
+        batch_size: int = 256,
+        batch_size_step: int = 256,
+        seed_value: int = 1,
+        dropout: float = 0.0,
+        d_model: int = 512,
+        seq_len: int = 32,
+        layer_norm: bool = True,
+        drop_path: float = 0.0,
+        unet: bool = False,
+        grad_checkpointing: bool = False,
+        num_layers: int = 8,
+        **kwargs
+    ):
+        super().__init__()
+        self.save_hyperparameters()
+        self.automatic_optimization = False
+        if seed_value != None:
+          pl.seed_everything(seed_value)
+          torch.manual_seed(seed_value)
+          torch.cuda.manual_seed(seed_value)
+          random.seed(seed_value)
+        self.main = ConstantBlock(module_configuration = [
+                {"type": "FeedForwardModule", "params": {"d_model": d_model, "dropout": dropout, "layer_norm": layer_norm}, "count": 1},
+                {"type": "AFTModule", "params": {"d_model": d_model, "seq_len": seq_len, "dropout": dropout, "layer_norm": layer_norm}, "count": 1},
+ ], 
+                 num_layers=num_layers, 
+                 unet=unet,
+                 grad_checkpointing=grad_checkpointing,
+                 drop_path=drop_path,
+                 dropout=dropout,
+                                 )
+        self.head_mantissa = nn.Linear(512, 1, bias=False)
+        self.head_tanh_value = nn.Linear(512, 1, bias=False)
+        self.tanh = nn.Tanh()
+        self.sigmoid = nn.Sigmoid()
+        self.head_exponent = nn.Linear(512, 2**8)
+        self.head_log10 = nn.Linear(512, 128)
+        self.head_decoder = nn.Linear(512, 32 * 2)
+        self.pool = torch.nn.AdaptiveAvgPool1d(1)
+        self.embedding = Embedding(2, 512)
+        self.pos_embedding = nn.Parameter(torch.randn(32, 1, 512))
+    def forward(self, data):
+        data = self.embedding(data) + self.pos_embedding
+        data = self.main(data)
+        data = self.pool(data.permute(1,2,0))[:, :, 0]
+        return data, self.sigmoid(self.head_mantissa(data)), self.head_exponent(data), self.tanh(self.head_tanh_value(data)), self.head_log10(data), self.head_decoder(data)
+    def get_features(self, data):
+        data = self.embedding(data) + self.pos_embedding
+        data = self.main(data)
+        data = self.pool(data.permute(1,2,0))[:, :, 0]
+        return data
+    def on_validation_epoch_end(self):
+        gc.collect()
+        self.trainer.save_checkpoint(filepath="/kaggle/working/checkpoint.ckpt")
+    def training_step(self, batch, batch_idx):
+        optimizer = self.optimizers()
+        # Generate random bits tensor
+        random_bits = torch.randint(0, 2, (self.hparams.batch_size_step, 32), device=self.device) 
+
+        # Convert to float
+        random_floats = bits_to_float(random_bits, 23, 8).nan_to_num(nan=0.0, posinf=0.0, neginf=0.0)
+
+        # Get mantissa and exponent
+        float_bits, mantissa, exponent = float_to_bits(random_floats, 23, 8, retun_ME=True)
+
+        # Calculate x and y 
+        x, y = self.calc_xy(random_floats)
+
+#         # Split tensor in half
+#         random_floats1 = random_floats[:self.hparams.batch_size_step//2] 
+#         random_floats2 = random_floats[self.hparams.batch_size_step//2:]
+
+#         # Calculate sum and difference
+#         sum_floats = random_floats1 + random_floats2
+#         diff_floats = random_floats1 - random_floats2
+
+#         # Get features for sum and diff
+#         sum_bits, sum_mantissa, sum_exponent = float_to_bits(sum_floats, 23, 8, retun_ME=True)
+#         diff_bits, diff_mantissa, diff_exponent = float_to_bits(diff_floats, 23, 8, retun_ME=True)
+
+#         sum_x, sum_y = self.calc_xy(sum_floats)
+
+#         diff_x, diff_y = self.calc_xy(diff_floats)
+        if random.uniform(0, 1) > 0.4:
+            logit, mantisa_out, exponent_out, tanh_out, log_10_out, decoder_out = self(float_bits)
+            loss_1 = self.calc_loss(mantisa_out, exponent_out, tanh_out, log_10_out, decoder_out, mantissa, exponent, x, y, float_bits)
+#             loss_sum = self.calc_loss(mantisa_out, exponent_out, tanh_out, log_10_out, decoder_out, mantissa, exponent, x, y, float_bits)
+
+            self.log('Loss/Train', loss_1, prog_bar=True, on_epoch=True)
+            self.manual_backward(loss_1)
+            optimizer.first_step(zero_grad=True)
+            logit, mantisa_out, exponent_out, tanh_out, log_10_out, decoder_out = self(float_bits)
+            loss_2 = self.calc_loss(mantisa_out, exponent_out, tanh_out, log_10_out, decoder_out, mantissa, exponent, x, y, float_bits)
+
+            self.log('Loss/Train_SAM', loss_2, prog_bar=True, on_epoch=True)
+            self.manual_backward(loss_2)
+            optimizer.second_step(zero_grad=True)
+        else:
+            logit, mantisa_out, exponent_out, tanh_out, log_10_out, decoder_out = self(float_bits)
+            loss_1 = self.calc_loss(mantisa_out, exponent_out, tanh_out, log_10_out, decoder_out, mantissa, exponent, x, y, float_bits)
+
+            self.log('Loss/Train', loss_1, prog_bar=True, on_epoch=True)
+            self.manual_backward(loss_1)
+            optimizer.base_optimizer.step()
+            optimizer.zero_grad()
+        return loss_1
+    def validation_step(self, batch, batch_idx):
+#         random_bits = batch[0]
+#         random_floats = bits_to_float(random_bits, 23, 8)
+
+#         # Get mantissa and exponent
+#         float_bits, mantissa, exponent = float_to_bits(random_floats, 23, 8, retun_ME=True)
+
+#         # Calculate x and y 
+#         x, y = self.calc_xy(random_floats)
+        
+#         mantisa_out, exponent_out, tanh_out, log_10_out, decoder_out = self(float_bits)
+#         loss = self.calc_loss(mantisa_out, exponent_out, tanh_out, log_10_out, decoder_out, mantissa, exponent, x, y, float_bits)
+        
+#         self.log('Loss/Validation', loss, prog_bar=True, on_epoch=True)
+        return None
+    def calc_xy(self, random_floats, max_y=127):
+        float_abs = torch.abs(random_floats)
+        y = torch.ceil(torch.log10(float_abs))
+        x = (random_floats / 10**y)
+        x[float_abs < 1] = random_floats[float_abs < 1]
+        y = torch.clamp(y, 0, max_y)
+        return x, y.long()
+    def calc_loss(self, mantisa_out, exponent_out, tanh_out, log_10_out, decoder_out, mantisa_target, exponent_target, tanh_target, log_10_target, decoder_target):
+        loss_reg = F.mse_loss(mantisa_out[:,0], mantisa_target) + F.l1_loss(mantisa_out[:,0], mantisa_target) + F.mse_loss(tanh_out[:,0], tanh_target) + F.l1_loss(tanh_out[:,0], tanh_target)
+        loss_cls = F.cross_entropy(exponent_out, exponent_target) + F.cross_entropy(log_10_out, log_10_target) + F.cross_entropy(decoder_out.reshape(-1, 2, 32), decoder_target)
+        return loss_reg + loss_cls
+    def configure_optimizers(self):
+        optimizer = SAM(list(self.parameters()), ModernOptimizer,
+                         lr=self.hparams.learning_rate, rho=2.0, adaptive=True
+                         )
+        return optimizer
+        
 class AutoEncoderModel(pl.LightningModule):
     def __init__(
         self,
