@@ -13,13 +13,11 @@ class SwiGLU(nn.Module):
     def forward(self, x):
       x, gate = x.chunk(2, dim = -1)
       return x * self.act(gate)
-      
 class SwiGLU_in(SwiGLU):
     def __init__(self):
         super(SwiGLU_in, self).__init__()
     def forward(self, x, gate):
       return x * self.act(gate)
-      
 class FeedForwardModule(nn.Module):
     """
     FeedForwardModule applies a feed-forward neural network to the input data.
@@ -28,6 +26,7 @@ class FeedForwardModule(nn.Module):
                  d_model: int,
                  dropout: float = 0.0,
                  layer_norm: bool = True,
+                 average_norm:bool = False,
                  **kwargs
                  ):
         """
@@ -44,10 +43,15 @@ class FeedForwardModule(nn.Module):
         self.act = SwiGLU()
         self.fc1 = nn.Linear(d_model, d_model * 2)
         self.fc2 = nn.Linear(d_model, d_model)
-        self.dropout = nn.Dropout(p=dropout)
-        self.layer_norm = Norm() if layer_norm else nn.Identity()
+        if layer_norm:
+            if average_norm:
+                self.layer_norm = Norm()
+            else:
+                self.layer_norm = TokenNorm()
+        else:
+            self.layer_norm = nn.Identity()
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, **kwargs) -> Tensor:
         """
         Forward pass of the FeedForwardModule.
 
@@ -58,10 +62,9 @@ class FeedForwardModule(nn.Module):
             Tensor: Output tensor after applying the feed-forward neural network.
         """
         x = self.layer_norm(x)
-        x = self.act(self.dropout(self.fc1(x)))
-        x = self.dropout(self.fc2(x))
+        x = self.act(self.fc1(x))
+        x = self.fc2(x)
         return x
-      
 class Pos_bias(nn.Module):
     def __init__(self,
                  d_model: int,
@@ -69,9 +72,8 @@ class Pos_bias(nn.Module):
                  ):
         super().__init__()
         self.pos_bias = nn.Parameter(torch.zeros(1, 1, d_model, d_model), requires_grad=True)
-    def forward(self, shape):
+    def forward(self, shape, **kwargs):
         return torch.nn.functional.interpolate(self.pos_bias, size=[shape, shape], mode='bilinear')[0,0]
-      
 class AFTModule(nn.Module):
     def __init__(self,
                  d_model: int,
@@ -85,67 +87,53 @@ class AFTModule(nn.Module):
         * `seq_len` is $T$
         """
         super().__init__()
-        self.dropout = nn.Dropout(p=dropout)
         self.qkv = nn.Linear(d_model, d_model * 3)
         self.pos_bias = Pos_bias(seq_len)
         self.activation = nn.Sigmoid()
         self.output = nn.Linear(d_model, d_model)#nn.Linear(d_model, d_model)
         if layer_norm:
-          self.layer_norm = Norm()
+          self.layer_norm = TokenNorm()
         else:
           self.layer_norm = nn.Identity()
-    def forward(self, data: torch.Tensor):
+    def forward(self, data: torch.Tensor, **kwargs):
         """
         `query`, `key` and `value` are the tensors that store
         collection of token embeddings for  *query*, *key* and *value*.
-        They have shape `[seq_len, batch_size, d_model]`.
+        They have shape `[batch_size, seq_len, d_model]`.
         `mask` has shape `[seq_len, seq_len, batch_size]` and
         `mask[i, j, b]` indicates whether for batch `b`,
         query at position `i` has access to key-value at position `j`.
         """
-        # `query`, `key` and `value`  have shape `[seq_len, batch_size, d_model]`
-        # [seq_len, channels, batch_size, d_model]
-        if len(data.shape) == 4:
-          reshape_bool = True
-          data = data.permute(0,3,2,1)
-          shape = data.shape
-          data = data.reshape(shape[0], shape[1], -1).permute(0,2,1)
-        else:
-          reshape_bool = False
-        query,key,value = self.qkv(self.layer_norm(self.dropout(data))).chunk(3, dim = -1)
-        pos_bias = self.dropout(self.pos_bias(len(data)))#self.pos_bias[:len(data), :len(data)]  #16896, 16896
-        pos_bias = pos_bias.unsqueeze(-1)
-        # pos_bias.masked_fill_(~mask, float('-inf'))
-        max_key = key.max(dim=0, keepdims=True)[0]
-        max_pos_bias = pos_bias.max(dim=1,  keepdims=True)[0]
-
-        exp_key = torch.exp(key - max_key)
-        exp_pos_bias = torch.exp(pos_bias - max_pos_bias)
-        num = torch.einsum('ijb,jbd->ibd', exp_pos_bias, exp_key * value)
-        den = torch.einsum('ijb,jbd->ibd', exp_pos_bias, exp_key)
-        y = self.output(self.activation(query) * num / den)
-        if reshape_bool:
-          y = y.permute(0,2,1)
-          y = y.reshape(shape[0], shape[1], shape[2], shape[3]).permute(0,3,2,1)
-        return y
-      
-class ResAttention(nn.Module):
+        query, key, value = self.qkv(self.layer_norm(data)).chunk(3, dim = -1)
+        pos_bias = self.pos_bias(len(data))
+        pos_bias = torch.exp(pos_bias.unsqueeze(-1))
+        key = torch.exp(key)
+        num = torch.einsum('ijb,jbd->ibd', pos_bias, torch.mul(key, value))
+        weighted = num / torch.einsum('ijb,jbd->ibd', pos_bias, key)
+        output = torch.mul(self.activation(query), weighted)
+        return self.output(output)
+class Residual(nn.Module):
     def __init__(self, 
-                 dropout,
                  **kwargs):
         super().__init__()
-        self.dropout = nn.Dropout(p=dropout)
-    def forward(self, data, residual):
+
+    def forward(self, data, residual, **kwargs):
         for i in data:
-          residual = residual + self.dropout(i)
+          residual = residual + i
         return residual
     
 class Norm(nn.Module):
     def __init__(self):
         super(Norm, self).__init__()
-    def forward(self, x):
-        return torch.nn.functional.layer_norm(x, [x.shape[-1]], eps=1e-20)
-      
+    def forward(self, x, **kwargs):
+        return torch.nn.functional.layer_norm(x, [x.shape[-1]], eps=torch.finfo(torch.float32).tiny)
+class TokenNorm(nn.Module):
+    def __init__(self, eps=torch.finfo(torch.float32).tiny):
+        super(TokenNorm, self).__init__()
+        self.eps = torch.finfo(torch.float32).tiny
+    def forward(self, x, **kwargs):
+        x = x - x.mean(dim=[0,2], keepdim=True)
+        return x / (x.std(dim=[0,2], keepdim=True) + self.eps)
 class Layer(nn.Module):
     def __init__(self,
                  module_configuration,
@@ -158,15 +146,14 @@ class Layer(nn.Module):
         self.module_configuration = module_configuration
         self.modules_list = nn.ModuleList()
         self._initialize_modules()
-        self.res_attention = ResAttention(dropout)
+        self.res_attention = Residual()
         self.grad_checkpointing = grad_checkpointing
-        self.drop_path = DropPath(drop_prob=drop_path)
     def forward(self, data, **kwargs):
         residual = data.clone()
         module_outputs = []
         for module, module_config in zip(self.modules_list, self.module_configuration):
-            if "pre_permute" in module_config["params"]:
-                input_data = input_data.permute(*module_config["params"]["pre_permute"])
+#             if "pre_permute" in module_config["params"]:
+#                 input_data = input_data.permute(*module_config["params"]["pre_permute"])
 
             if self.grad_checkpointing:
               output_data = torch.utils.checkpoint.checkpoint(module, data, **kwargs)
@@ -176,7 +163,7 @@ class Layer(nn.Module):
             if "post_permute" in module_config["params"]:
                 output_data = output_data.permute(*module_config["params"]["post_permute"])
 
-            module_outputs.append(self.drop_path(output_data))
+            module_outputs.append(output_data)
 
         return self.res_attention(module_outputs, residual)
     def _initialize_modules(self):
@@ -206,9 +193,20 @@ class Layer(nn.Module):
                   wrapper_class = wrapper_mapping[wrapper_type]
                   module = wrapper_class(module_class(**module_params), **module_config["wrapper"])
                 else:
-                  module = module_class(**module_params)
+                  module = SequentialModule([RegulationLayer(p_GaussianDropout_Mul=0.0, p_GaussianDropout_Add=0.0, p_DropPath=0.0, DropPath_dims=[1], p_Dropout=0.0),
+                                         module_class(**module_params),
+                                         RegulationLayer(p_GaussianDropout_Mul=0.0, p_GaussianDropout_Add=0.0, p_DropPath=0.0, DropPath_dims=[1], p_Dropout=0.0)
+                                            ])
                 self.modules_list.append(module)
-              
+class SequentialModule(nn.Module):
+    def __init__(self, modules):
+        super(SequentialModule, self).__init__()
+        self.module_list = nn.ModuleList(modules)
+
+    def forward(self, x, **kwargs):
+        for module in self.module_list:
+            x = module(x, **kwargs)
+        return x
 class ConstantBlock(nn.Module):
     def __init__(self,
                  module_configuration,
@@ -222,14 +220,13 @@ class ConstantBlock(nn.Module):
                  ):
         super(ConstantBlock, self).__init__()
         self.layers = nn.ModuleList()
-        self.shuffle = shuffle
         self.layers.extend([Layer(module_configuration, layer_norm, grad_checkpointing, drop_path, dropout) for _ in range(num_layers)])
         if unet:
-          self.res = ResAttention(dropout=dropout)
+          self.res = Residual()
         else:
           self.res = None
-    def forward(self, x, **kwargs):
-        if self.shuffle:
+    def forward(self, x, shuffle=False, **kwargs):
+        if shuffle:
           random.shuffle(self.layers)
         if self.res != None:
           data = []
@@ -248,11 +245,57 @@ class Embedding(nn.Module):
         self.n_token = n_token
         self.d_model = d_model
         self.embed_scale = d_model ** 0.5
-        self.layer_norm = nn.LayerNorm(d_model, elementwise_affine=False)
+        self.layer_norm = TokenNorm()
         self.emb = nn.Embedding(n_token, d_model)
-    def forward(self, inp):
+    def forward(self, inp, **kwargs):
         embed = self.emb(inp)
-        return self.layer_norm(embed.mul_(self.embed_scale)).permute(1,0,2)
+        return self.layer_norm(embed.mul_(self.embed_scale).permute(1,0,2))
+class RegulationLayer(nn.Module):
+    def __init__(self, p_GaussianDropout_Mul=0.0, p_GaussianDropout_Add=0.0, p_DropPath=0.5, DropPath_dims=[0], p_Dropout=0.0):
+        super(RegulationLayer, self).__init__()
+        if p_GaussianDropout_Mul < 0 or p_GaussianDropout_Mul >= 1:
+            raise Exception("p_GaussianDropout_Mul value should accomplish 0 < p_GaussianDropout_Mul < 1")
+        if p_GaussianDropout_Add < 0 or p_GaussianDropout_Add >= 1:
+            raise Exception("p_GaussianDropout_Add value should accomplish 0 < p_GaussianDropout_Add < 1")
+        if p_DropPath < 0 or p_DropPath >= 1:
+            raise Exception("p_DropPath value should accomplish 0 < p_DropPath < 1")
+        if p_Dropout < 0 or p_Dropout >= 1:
+            raise Exception("p_Dropout value should accomplish 0 < p_Dropout < 1")
+        self.p_GaussianDropout_Mul = p_GaussianDropout_Mul
+        self.p_GaussianDropout_Add = p_GaussianDropout_Add
+        self.p_DropPath = p_DropPath
+        self.DropPath_dims = DropPath_dims
+        self.p_Dropout = p_Dropout
+    def forward(self, x, freeze=False, skip=False, **kwargs):
+        if self.training and not skip:
+            if self.p_GaussianDropout_Mul != 0:
+                if not freeze:
+                    stddev = (self.p_GaussianDropout_Mul / (1.0 - self.p_GaussianDropout_Mul))**0.5
+                    self.epsilon_mul = torch.randn_like(x) * stddev
+                x = x * self.epsilon_mul
+            if self.p_GaussianDropout_Add != 0:
+                if not freeze:
+                    stddev = (self.p_GaussianDropout_Add / (1.0 - self.p_GaussianDropout_Add))**0.5
+                    self.epsilon_add = torch.randn_like(x) * stddev
+                x = x + self.epsilon_add
+            if self.p_DropPath != 0:
+                if not freeze:
+                    shape = list(x.shape)
+                    for i in range(len(shape)):
+                        if i not in self.DropPath_dims:
+                            shape[i] = 1
+                    self.mask_DropPath = x.new_empty(shape).bernoulli_(self.p_DropPath)
+#                     self.mask_DropPath.div_(self.p_DropPath)
+                x = x * self.mask_DropPath
+            if self.p_Dropout != 0:
+                if not freeze:
+                    shape = list(x.shape)
+                    self.mask_Dropout = x.new_empty(shape).bernoulli_(self.p_Dropout)
+                    self.mask_Dropout.div_(self.p_Dropout)
+                x = x * self.mask_Dropout
+        return x
+    def __repr__(self):
+        return f"{self.__class__.__name__}(p_GaussianDropout_Mul={self.p_GaussianDropout_Mul})"
       
 class Encoder(nn.Module):
     def __init__(self,
@@ -353,13 +396,13 @@ class NumberModel(pl.LightningModule):
         batch_size_step: int = 256,
         seed_value: int = 1,
         dropout: float = 0.0,
-        d_model: int = 512,
+        d_model: int = 16,
         seq_len: int = 32,
         layer_norm: bool = True,
         drop_path: float = 0.0,
         unet: bool = False,
         grad_checkpointing: bool = False,
-        num_layers: int = 8,
+        num_layers: int = 12,
         **kwargs
     ):
         super().__init__()
@@ -387,29 +430,48 @@ class NumberModel(pl.LightningModule):
         self.head_exponent = nn.Linear(512, 2**8)
         self.head_log10 = nn.Linear(512, 128)
         self.head_decoder = nn.Linear(512, 32 * 2)
-        self.pool = torch.nn.AdaptiveAvgPool1d(1)
-        self.embedding = Embedding(2, 512)
-        self.pos_embedding = nn.Parameter(torch.randn(32, 1, 512))
+        self.pool = nn.Flatten(1)
+        self.embedding = Embedding(2, 16)
+        self.pos_embedding = nn.Parameter(torch.randn(32, 1, 16))
+        self.norm = TokenNorm() #nn.Identity()#
+        self.post_norm = Norm()
+        
+        self.sin_head = nn.Linear(512, 8, bias=False)
+        self.post_net = FeedForwardModule(512, layer_norm=False)
+#         self.cos_head = nn.Linear(512, 1, bias=False)
+#         self.log_sin_head = nn.Linear(512, 1, bias=False)
+        
     def forward(self, data):
         data = self.embedding(data) + self.pos_embedding
         data = self.main(data)
-        data = self.pool(data.permute(1,2,0))[:, :, 0]
+        data = self.pool(self.norm(data).permute(1,2,0))
+        data = self.post_norm(self.post_net(data) + data)
         return data, self.sigmoid(self.head_mantissa(data)), self.head_exponent(data), self.tanh(self.head_tanh_value(data)), self.head_log10(data), self.head_decoder(data)
     def get_features(self, data):
         data = self.embedding(data) + self.pos_embedding
         data = self.main(data)
-        data = self.pool(data.permute(1,2,0))[:, :, 0]
+        data = self.pool(self.norm(data).permute(1,2,0))
+        data = self.post_norm(self.post_net(data) + data)
         return data
     def on_validation_epoch_end(self):
         gc.collect()
         self.trainer.save_checkpoint(filepath="/kaggle/working/checkpoint.ckpt")
     def training_step(self, batch, batch_idx):
         optimizer = self.optimizers()
+        if batch_idx == 0:
+            optimizer.lr[0].data = optimizer.lr[0].data - optimizer.lr[0].data + 0.0000001 ** 0.5
+            self.hparams.batch_size_step = 2048*2
         # Generate random bits tensor
         random_bits = torch.randint(0, 2, (self.hparams.batch_size_step, 32), device=self.device) 
 
         # Convert to float
         random_floats = bits_to_float(random_bits, 23, 8).nan_to_num(nan=0.0, posinf=0.0, neginf=0.0)
+        
+        add_info = torch.cat([random_floats[:,None].sin(), random_floats[:,None].cos(),
+                              random_floats[:,None].abs().log2().sin().nan_to_num(nan=0.0, posinf=0.0, neginf=0.0), random_floats[:,None].abs().log10().sin().nan_to_num(nan=0.0, posinf=0.0, neginf=0.0),
+                              random_floats[:,None].abs().log2().cos().nan_to_num(nan=0.0, posinf=0.0, neginf=0.0), random_floats[:,None].abs().log10().cos().nan_to_num(nan=0.0, posinf=0.0, neginf=0.0),
+                              random_floats[:,None].abs().sqrt().sin(), random_floats[:,None].abs().sqrt().cos()
+                             ],dim=-1)
 
         # Get mantissa and exponent
         float_bits, mantissa, exponent = float_to_bits(random_floats, 23, 8, retun_ME=True)
@@ -432,28 +494,65 @@ class NumberModel(pl.LightningModule):
 #         sum_x, sum_y = self.calc_xy(sum_floats)
 
 #         diff_x, diff_y = self.calc_xy(diff_floats)
-        if random.uniform(0, 1) > 0.4:
-            logit, mantisa_out, exponent_out, tanh_out, log_10_out, decoder_out = self(float_bits)
-            loss_1 = self.calc_loss(mantisa_out, exponent_out, tanh_out, log_10_out, decoder_out, mantissa, exponent, x, y, float_bits)
-#             loss_sum = self.calc_loss(mantisa_out, exponent_out, tanh_out, log_10_out, decoder_out, mantissa, exponent, x, y, float_bits)
+#         if random.uniform(0, 1) > 10.4:
+#             logit, mantisa_out, exponent_out, tanh_out, log_10_out, decoder_out = self(float_bits)
+#             loss_1 = self.calc_loss(mantisa_out, exponent_out, tanh_out, log_10_out, decoder_out, mantissa, exponent, x, y, float_bits)
+# #             loss_sum = self.calc_loss(mantisa_out, exponent_out, tanh_out, log_10_out, decoder_out, mantissa, exponent, x, y, float_bits)
 
-            self.log('Loss/Train', loss_1, prog_bar=True, on_epoch=True)
-            self.manual_backward(loss_1)
-            optimizer.first_step(zero_grad=True)
-            logit, mantisa_out, exponent_out, tanh_out, log_10_out, decoder_out = self(float_bits)
-            loss_2 = self.calc_loss(mantisa_out, exponent_out, tanh_out, log_10_out, decoder_out, mantissa, exponent, x, y, float_bits)
+#             self.log('Loss/Train', loss_1, prog_bar=True, on_epoch=True)
+#             self.manual_backward(loss_1)
+#             optimizer.first_step(zero_grad=True)
+#             logit, mantisa_out, exponent_out, tanh_out, log_10_out, decoder_out = self(float_bits)
+#             loss_2 = self.calc_loss(mantisa_out, exponent_out, tanh_out, log_10_out, decoder_out, mantissa, exponent, x, y, float_bits)
 
-            self.log('Loss/Train_SAM', loss_2, prog_bar=True, on_epoch=True)
-            self.manual_backward(loss_2)
-            optimizer.second_step(zero_grad=True)
-        else:
-            logit, mantisa_out, exponent_out, tanh_out, log_10_out, decoder_out = self(float_bits)
-            loss_1 = self.calc_loss(mantisa_out, exponent_out, tanh_out, log_10_out, decoder_out, mantissa, exponent, x, y, float_bits)
+#             self.log('Loss/Train_SAM', loss_2, prog_bar=True, on_epoch=True)
+#             self.manual_backward(loss_2)
+#             optimizer.second_step(zero_grad=True)
+#         else:
+        logit, mantisa_out, exponent_out, tanh_out, log_10_out, decoder_out = self(float_bits)
+        loss_1 = self.calc_loss(mantisa_out, exponent_out, tanh_out, log_10_out, decoder_out, mantissa, exponent, x, y, float_bits)
+#         print("loss do", loss_1)
+        info_logit = self.tanh(self.sin_head(logit))
+        info_loss = F.mse_loss(info_logit, add_info) + F.l1_loss(info_logit, add_info)
 
-            self.log('Loss/Train', loss_1, prog_bar=True, on_epoch=True)
-            self.manual_backward(loss_1)
-            optimizer.base_optimizer.step()
+        self.log('Loss/Train', loss_1, prog_bar=True, on_epoch=True)
+        self.log('InfoLoss/Train', info_loss, prog_bar=True, on_epoch=True)
+        self.manual_backward(loss_1 + info_loss)
+        if batch_idx % 8 != 765:
+            optimizer.step(SAM_step=False)
             optimizer.zero_grad()
+        else:
+            optimizer.step(SAM_step=False, update=False)
+#             weight = optimizer.get_weight()
+            optimizer.zero_grad()
+            for i in range(len(optimizer.lr) - 1):
+                optimizer.meta_step(i)
+                logit, mantisa_out, exponent_out, tanh_out, log_10_out, decoder_out = self(float_bits)
+                loss_meta = self.calc_loss(mantisa_out, exponent_out, tanh_out, log_10_out, decoder_out, mantissa, exponent, x, y, float_bits)
+#                 print(loss_meta)
+                self.manual_backward(loss_meta)
+            optimizer.return_state_step(len(optimizer.lr) - 1)
+            
+#             logit, mantisa_out, exponent_out, tanh_out, log_10_out, decoder_out = self(float_bits)
+#             loss_meta = self.calc_loss(mantisa_out, exponent_out, tanh_out, log_10_out, decoder_out, mantissa, exponent, x, y, float_bits)
+            
+#             print("new loss", loss_meta)
+            self.log('Loss/Train_Correct', loss_meta, prog_bar=True, on_epoch=True)
+#             print("new lr",optimizer.get_lr(optimizer.lr[0].detach()))
+            for name, value in optimizer.lr.items():
+                self.log('Lr_' + str(name), optimizer.get_lr(value.detach()), prog_bar=True, on_epoch=True)
+#             optimizer.install_weight(weight)
+            
+#             logit, mantisa_out, exponent_out, tanh_out, log_10_out, decoder_out = self(float_bits)
+#             loss_meta = self.calc_loss(mantisa_out, exponent_out, tanh_out, log_10_out, decoder_out, mantissa, exponent, x, y, float_bits)
+#             print("old loss", loss_meta)
+            
+#             optimizer.update_step()
+            
+#             logit, mantisa_out, exponent_out, tanh_out, log_10_out, decoder_out = self(float_bits)
+#             loss_meta = self.calc_loss(mantisa_out, exponent_out, tanh_out, log_10_out, decoder_out, mantissa, exponent, x, y, float_bits)
+#             print("true loss", loss_meta)
+#             print("")
         return loss_1
     def validation_step(self, batch, batch_idx):
 #         random_bits = batch[0]
@@ -482,8 +581,8 @@ class NumberModel(pl.LightningModule):
         loss_cls = F.cross_entropy(exponent_out, exponent_target) + F.cross_entropy(log_10_out, log_10_target) + F.cross_entropy(decoder_out.reshape(-1, 2, 32), decoder_target)
         return loss_reg + loss_cls
     def configure_optimizers(self):
-        optimizer = SAM(list(self.parameters()), ModernOptimizer,
-                         lr=self.hparams.learning_rate, rho=2.0, adaptive=True
+        optimizer = ModernOptimizer(list(self.parameters()),
+                         lr=self.hparams.learning_rate, SAM=False, eps=torch.finfo(torch.float32).tiny
                          )
         return optimizer
         
