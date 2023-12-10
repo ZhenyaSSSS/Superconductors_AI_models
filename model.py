@@ -18,6 +18,23 @@ class SwiGLU_in(SwiGLU):
         super(SwiGLU_in, self).__init__()
     def forward(self, x, gate):
       return x * self.act(gate)
+class FFTLinear(nn.Module):
+    def __init__(self,
+                 d_model_input: int,
+                 d_model_output: int,
+                 **kwargs
+                 ):
+        super(FFTLinear, self).__init__()
+        self.d_model_input = d_model_input
+        self.d_model_output = d_model_output
+        self.input_mul = nn.Parameter(torch.ones(d_model_input), requires_grad=True)
+        self.deep_mul = nn.Parameter(torch.ones(d_model_output), requires_grad=True)
+    def forward(self, x: Tensor, **kwargs) -> Tensor:
+        x = torch.fft.fft(x * self.input_mul, axis=-1, n=self.d_model_output)
+        x = x * torch.fft.fft(self.deep_mul)
+        x = torch.fft.ifft(x, axis=-1, n=x.shape[-1])
+        return x.real
+
 class FeedForwardModule(nn.Module):
     """
     FeedForwardModule applies a feed-forward neural network to the input data.
@@ -26,7 +43,7 @@ class FeedForwardModule(nn.Module):
                  d_model: int,
                  dropout: float = 0.0,
                  layer_norm: bool = True,
-                 average_norm:bool = False,
+                 average_norm:bool = True,
                  **kwargs
                  ):
         """
@@ -80,6 +97,7 @@ class AFTModule(nn.Module):
                  seq_len: int,
                  dropout: float = 0.0,
                  layer_norm: bool = False,
+                 average_norm:bool = True,
                  **kwargs
                  ):
         """
@@ -92,9 +110,12 @@ class AFTModule(nn.Module):
         self.activation = nn.Sigmoid()
         self.output = nn.Linear(d_model, d_model)#nn.Linear(d_model, d_model)
         if layer_norm:
-          self.layer_norm = TokenNorm()
+            if average_norm:
+                self.layer_norm = Norm()
+            else:
+                self.layer_norm = TokenNorm()
         else:
-          self.layer_norm = nn.Identity()
+            self.layer_norm = nn.Identity()
     def forward(self, data: torch.Tensor, **kwargs):
         """
         `query`, `key` and `value` are the tensors that store
@@ -400,7 +421,7 @@ class NumberModel(pl.LightningModule):
         seq_len: int = 32,
         layer_norm: bool = True,
         drop_path: float = 0.0,
-        unet: bool = False,
+        unet: bool = True,
         grad_checkpointing: bool = False,
         num_layers: int = 12,
         **kwargs
@@ -413,16 +434,16 @@ class NumberModel(pl.LightningModule):
           torch.manual_seed(seed_value)
           torch.cuda.manual_seed(seed_value)
           random.seed(seed_value)
-        self.main = ConstantBlock(module_configuration = [
-                {"type": "FeedForwardModule", "params": {"d_model": d_model, "dropout": dropout, "layer_norm": layer_norm}, "count": 1},
-                {"type": "AFTModule", "params": {"d_model": d_model, "seq_len": seq_len, "dropout": dropout, "layer_norm": layer_norm}, "count": 1},
- ], 
-                 num_layers=num_layers, 
-                 unet=unet,
-                 grad_checkpointing=grad_checkpointing,
-                 drop_path=drop_path,
-                 dropout=dropout,
-                                 )
+#         self.main = ConstantBlock(module_configuration = [
+#                 {"type": "FeedForwardModule", "params": {"d_model": d_model, "dropout": dropout, "layer_norm": layer_norm, "average_norm": False}, "count": 1},
+#                 {"type": "AFTModule", "params": {"d_model": d_model, "seq_len": seq_len, "dropout": dropout, "layer_norm": layer_norm, "average_norm": False}, "count": 1},
+#  ], 
+#                  num_layers=num_layers, 
+#                  unet=unet,
+#                  grad_checkpointing=grad_checkpointing,
+#                  drop_path=drop_path,
+#                  dropout=dropout,
+#                                  )
         self.head_mantissa = nn.Linear(512, 1, bias=False)
         self.head_tanh_value = nn.Linear(512, 1, bias=False)
         self.tanh = nn.Tanh()
@@ -433,45 +454,65 @@ class NumberModel(pl.LightningModule):
         self.pool = nn.Flatten(1)
         self.embedding = Embedding(2, 16)
         self.pos_embedding = nn.Parameter(torch.randn(32, 1, 16))
-        self.norm = TokenNorm() #nn.Identity()#
-        self.post_norm = Norm()
+        self.norm = Norm() #nn.Identity()#
+#         self.post_norm = Norm()
         
         self.sin_head = nn.Linear(512, 8, bias=False)
-        self.post_net = FeedForwardModule(512, layer_norm=False)
-#         self.cos_head = nn.Linear(512, 1, bias=False)
-#         self.log_sin_head = nn.Linear(512, 1, bias=False)
+        self.post_net = ConstantBlock(module_configuration = [
+                {"type": "FeedForwardModule", "params": {"d_model": 512, "dropout": dropout, "layer_norm": layer_norm, "average_norm": True}, "count": 1},
+ ], 
+                 num_layers=num_layers, 
+                 unet=unet,
+                 grad_checkpointing=grad_checkpointing,
+                 drop_path=drop_path,
+                 dropout=dropout,
+                                 )
+        self.sq_head = nn.Linear(512, 2*32, bias=False)
+        self.log2_head = nn.Linear(512, 2*32, bias=False)
+        self.log10_head = nn.Linear(512, 2*32, bias=False)
+        self.int_n_head = nn.Linear(512, 2*64, bias=False)
         
     def forward(self, data):
         data = self.embedding(data) + self.pos_embedding
-        data = self.main(data)
-        data = self.pool(self.norm(data).permute(1,2,0))
-        data = self.post_norm(self.post_net(data) + data)
+        data = self.pool(data.permute(1,2,0))
+        data = self.norm(self.post_net(data))
         return data, self.sigmoid(self.head_mantissa(data)), self.head_exponent(data), self.tanh(self.head_tanh_value(data)), self.head_log10(data), self.head_decoder(data)
     def get_features(self, data):
         data = self.embedding(data) + self.pos_embedding
-        data = self.main(data)
-        data = self.pool(self.norm(data).permute(1,2,0))
-        data = self.post_norm(self.post_net(data) + data)
+        data = self.pool(data.permute(1,2,0))
+        data = self.norm(self.post_net(data))
         return data
     def on_validation_epoch_end(self):
         gc.collect()
         self.trainer.save_checkpoint(filepath="/kaggle/working/checkpoint.ckpt")
+    def binary(self, x, bits):
+        mask = 2**torch.arange(bits).to(x.device, x.dtype)
+        return x.unsqueeze(-1).bitwise_and(mask).ne(0).long()
     def training_step(self, batch, batch_idx):
         optimizer = self.optimizers()
         if batch_idx == 0:
-            optimizer.lr[0].data = optimizer.lr[0].data - optimizer.lr[0].data + 0.0000001 ** 0.5
-            self.hparams.batch_size_step = 2048*2
+            optimizer.lr[0].data = optimizer.lr[0].data - optimizer.lr[0].data + 0.000000025
+            self.hparams.batch_size_step = 2048*8
         # Generate random bits tensor
         random_bits = torch.randint(0, 2, (self.hparams.batch_size_step, 32), device=self.device) 
 
         # Convert to float
         random_floats = bits_to_float(random_bits, 23, 8).nan_to_num(nan=0.0, posinf=0.0, neginf=0.0)
+        sq = random_floats[:,None].abs().sqrt()
+        log2 = random_floats[:,None].abs().log2()
+        log10 = random_floats[:,None].abs().log10() #float_to_bits(log10, 23, 8)
+        int_n = random_floats[:,None].long() 
         
-        add_info = torch.cat([random_floats[:,None].sin(), random_floats[:,None].cos(),
-                              random_floats[:,None].abs().log2().sin().nan_to_num(nan=0.0, posinf=0.0, neginf=0.0), random_floats[:,None].abs().log10().sin().nan_to_num(nan=0.0, posinf=0.0, neginf=0.0),
-                              random_floats[:,None].abs().log2().cos().nan_to_num(nan=0.0, posinf=0.0, neginf=0.0), random_floats[:,None].abs().log10().cos().nan_to_num(nan=0.0, posinf=0.0, neginf=0.0),
-                              random_floats[:,None].abs().sqrt().sin(), random_floats[:,None].abs().sqrt().cos()
+        add_info = torch.cat([random_floats[:,None].sin().nan_to_num(nan=0.0, posinf=0.0, neginf=0.0), random_floats[:,None].cos().nan_to_num(nan=0.0, posinf=0.0, neginf=0.0),
+                              log2.sin().nan_to_num(nan=0.0, posinf=0.0, neginf=0.0), log10.sin().nan_to_num(nan=0.0, posinf=0.0, neginf=0.0),
+                              log2.cos().nan_to_num(nan=0.0, posinf=0.0, neginf=0.0), log10.cos().nan_to_num(nan=0.0, posinf=0.0, neginf=0.0),
+                              sq.sin().nan_to_num(nan=0.0, posinf=0.0, neginf=0.0), sq.cos().nan_to_num(nan=0.0, posinf=0.0, neginf=0.0)
                              ],dim=-1)
+        
+        sq = float_to_bits(sq[:,0], 23, 8)
+        log2 = float_to_bits(log2[:,0].nan_to_num(nan=0.0, posinf=0.0, neginf=0.0), 23, 8)
+        log10 = float_to_bits(log10[:,0].nan_to_num(nan=0.0, posinf=0.0, neginf=0.0), 23, 8)
+        int_n = self.binary(int_n[:,0], 64)
 
         # Get mantissa and exponent
         float_bits, mantissa, exponent = float_to_bits(random_floats, 23, 8, retun_ME=True)
@@ -511,15 +552,47 @@ class NumberModel(pl.LightningModule):
 #         else:
         logit, mantisa_out, exponent_out, tanh_out, log_10_out, decoder_out = self(float_bits)
         loss_1 = self.calc_loss(mantisa_out, exponent_out, tanh_out, log_10_out, decoder_out, mantissa, exponent, x, y, float_bits)
-#         print("loss do", loss_1)
         info_logit = self.tanh(self.sin_head(logit))
         info_loss = F.mse_loss(info_logit, add_info) + F.l1_loss(info_logit, add_info)
+        for i in range(8):
+            self.log('InfoLoss/' + str(i), F.l1_loss(info_logit[:, i], add_info[:, i]), prog_bar=True, on_epoch=True)
+            self.log('Real/' + str(i), add_info[0, i], prog_bar=True, on_epoch=True)
+            self.log('Fake/' + str(i), info_logit[0, i], prog_bar=True, on_epoch=True)
+        
+        sq_logit = self.sq_head(logit)
+        log2_logit = self.log2_head(logit)
+        log10_logit = self.log10_head(logit)
+        int_n_logit = self.int_n_head(logit)
+        
+        loss_sq = F.cross_entropy(sq_logit.reshape(-1, 2, 32), sq)
+        self.log('Sq/Train', loss_sq, prog_bar=True, on_epoch=True)
+        self.log('Sq/Train_F1', torchmetrics.functional.f1_score(sq_logit.reshape(-1, 2, 32), sq, task="multiclass", num_classes=2, average="macro"), prog_bar=True, on_epoch=True)
+        loss_log2 = F.cross_entropy(log2_logit.reshape(-1, 2, 32), log2)
+        self.log('Log2/Train', loss_log2, prog_bar=True, on_epoch=True)
+        self.log('Log2/Train_F1', torchmetrics.functional.f1_score(log2_logit.reshape(-1, 2, 32), log2, task="multiclass", num_classes=2, average="macro"), prog_bar=True, on_epoch=True)
+        loss_log10 = F.cross_entropy(log10_logit.reshape(-1, 2, 32), log10)
+        self.log('Log10/Train', loss_log10, prog_bar=True, on_epoch=True)
+        self.log('Log10/Train_F1', torchmetrics.functional.f1_score(log10_logit.reshape(-1, 2, 32), log10, task="multiclass", num_classes=2, average="macro"), prog_bar=True, on_epoch=True)
+        loss_int_n = F.cross_entropy(int_n_logit.reshape(-1, 2, 64), int_n)
+        self.log('Int_n/Train', loss_int_n, prog_bar=True, on_epoch=True)
+        self.log('Int_n/Train_F1', torchmetrics.functional.f1_score(int_n_logit.reshape(-1, 2, 64), int_n, task="multiclass", num_classes=2, average="macro"), prog_bar=True, on_epoch=True)
 
         self.log('Loss/Train', loss_1, prog_bar=True, on_epoch=True)
         self.log('InfoLoss/Train', info_loss, prog_bar=True, on_epoch=True)
-        self.manual_backward(loss_1 + info_loss)
+        hessian_calc = batch_idx % 5 == 0
+        self.manual_backward(loss_1 + info_loss + loss_sq + loss_log2 + loss_log10 + loss_int_n, create_graph=hessian_calc)
         if batch_idx % 8 != 765:
-            optimizer.step(SAM_step=False)
+#             optimizer.step(SAM_step=True)
+#             optimizer.zero_grad()
+#             logit, mantisa_out, exponent_out, tanh_out, log_10_out, decoder_out = self(float_bits)
+#             loss_1 = self.calc_loss(mantisa_out, exponent_out, tanh_out, log_10_out, decoder_out, mantissa, exponent, x, y, float_bits)
+#             info_logit = self.tanh(self.sin_head(logit))
+#             info_loss = F.mse_loss(info_logit, add_info) + F.l1_loss(info_logit, add_info)
+
+#             self.log('Loss/Train_SAM', loss_1, prog_bar=True, on_epoch=True)
+#             self.log('InfoLoss/Train_SAM', info_loss, prog_bar=True, on_epoch=True)
+#             self.manual_backward(loss_1 + info_loss, create_graph=True)
+            optimizer.step(SAM_step=False, hessian_calc=hessian_calc)
             optimizer.zero_grad()
         else:
             optimizer.step(SAM_step=False, update=False)
@@ -581,8 +654,25 @@ class NumberModel(pl.LightningModule):
         loss_cls = F.cross_entropy(exponent_out, exponent_target) + F.cross_entropy(log_10_out, log_10_target) + F.cross_entropy(decoder_out.reshape(-1, 2, 32), decoder_target)
         return loss_reg + loss_cls
     def configure_optimizers(self):
+#         monolithic_param = nn.Parameter(torch.cat([p.data.view(-1) for p in self.parameters()]))
+#         print(monolithic_param.shape)
+#         offset = 0
+#         for name, param in self.named_parameters():
+#             if '.' in name:
+#                 module_name, param_name = name.rsplit('.', 1)
+#                 module = reduce(getattr, module_name.split('.'), model)
+#             else:
+#                 module = self
+#                 param_name = name
+#             size = param.size()
+#             setattr(module, param_name, MonolithicParameter(monolithic_param, offset, *size))
+#             offset += np.prod(size)
+#         for name, param in self.named_parameters():
+#             size = param.size()
+#             setattr(self, name, MonolithicParameter(monolithic_param, offset, *size))
+#             offset += np.prod(size)
         optimizer = ModernOptimizer(list(self.parameters()),
-                         lr=self.hparams.learning_rate, SAM=False, eps=torch.finfo(torch.float32).tiny
+                         lr=self.hparams.learning_rate, SAM=False, eps=0.00000000001
                          )
         return optimizer
         
